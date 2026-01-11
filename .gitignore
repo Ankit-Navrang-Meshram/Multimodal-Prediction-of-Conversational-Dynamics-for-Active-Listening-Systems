@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# ML / Data
+data/
+datasets/
+features/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.wav
+*.mp4
+runs/
