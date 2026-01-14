@@ -1,18 +1,17 @@
-# Multimodal Turn-Taking Detection in Conversations
-
+# Multimodal Prediction of Conversational Dynamics for Active Listening Systems
 A PyTorch-based framework for detecting turn-taking behaviors in face-to-face conversations using multimodal fusion of text, audio, and video data.
 
 ## 📋 Table of Contents
-- [Overview](#overview)
-- [Features](#features)
-- [Installation](#installation)
-- [Dataset Structure](#dataset-structure)
-- [Quick Start](#quick-start)
-- [Training Pipeline](#training-pipeline)
-- [Model Architecture](#model-architecture)
-- [Fusion Mechanisms](#fusion-mechanisms)
-- [Results](#results)
-- [Citation](#citation)
+- [Overview](##overview)
+- [Features](##features)
+- [Installation](##installation)
+- [Dataset Structure](##dataset-structure)
+- [Quick Start](##quick-start)
+- [Training Pipeline](##training-pipeline)
+- [Model Architecture](##model-architecture)
+- [Fusion Mechanisms](##fusion-mechanisms)
+- [Results](##results)
+- [Citation](##citation)
 
 ## 🎯 Overview
 
@@ -56,8 +55,8 @@ The framework supports:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/multimodal-turn-taking.git
-cd multimodal-turn-taking
+git clone https://github.com/Ankit-Navrang-Meshram/Multimodal-Prediction-of-Conversational-Dynamics-for-Active-Listening-Systems.git
+cd Multimodal-Prediction-of-Conversational-Dynamics-for-Active-Listening-Systems
 
 # Create virtual environment
 conda create -n mmtt python=3.10
@@ -272,7 +271,7 @@ Example results on conversation dataset:
 | LMF | 0.XX | 0.XX | 0.XX | 0.XX | 0.XX |
 | Transformer | 0.XX | 0.XX | 0.XX | 0.XX | 0.XX |
 
-*Note: Fill in with your actual results*
+*Note: Wait For Results*
 
 ## 🎛️ Key Parameters
 
@@ -357,21 +356,21 @@ python train_multimodal.py \
 If you use this code in your research, please cite:
 
 ```bibtex
-@software{multimodal_turn_taking_2025,
-  author = {Your Name},
-  title = {Multimodal Turn-Taking Detection Framework},
+@software{Multimodal-Prediction-of-Conversational-Dynamics-for-Active-Listening-Systems,
+  author = {Ankit Navrang Meshram},
+  title = {Multimodal Prediction of Conversational Dynamics for Active Listening Systems,
   year = {2025},
-  url = {https://github.com/yourusername/multimodal-turn-taking}
+  url = {https://github.com/Ankit-Navrang-Meshram/Multimodal-Prediction-of-Conversational-Dynamics-for-Active-Listening-Systems.git}
 }
 ```
 
-## 🤝 Contributing
+<!-- ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the LICENSE file for details. -->
 
 ## 🙏 Acknowledgments
 
@@ -379,10 +378,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - HuBERT: Facebook AI
 - VideoMAE: MCG-NJU
 - Fusion mechanisms inspired by various multimodal learning papers
-
+<!-- 
 ## 📧 Contact
 
-For questions or issues, please open an issue on GitHub or contact [your.email@example.com]
+For questions or issues, please open an issue on GitHub or contact [your.email@example.com] -->
 
 ---
 
