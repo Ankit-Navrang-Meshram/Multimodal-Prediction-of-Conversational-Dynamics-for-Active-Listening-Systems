@@ -1,11 +1,21 @@
-torch
-transformers
-datasets
-tqdm
-scikit-learn
-opencv-python
-pandas
-librosa
-whisperx
-batch-face
-tensorboard
+# Core deep learning stack
+torch>=2.0
+transformers>=4.30
+datasets>=2.0
+
+# Data + media
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+librosa>=0.10
+opencv-python>=4.8
+
+# Logging + utilities
+tensorboard>=2.13
+tqdm>=4.65
+openpyxl>=3.1
+matplotlib>=3.7
+
+# Inference-only (optional — install for scripts/inference.py)
+# whisperx>=3.0
+# batch-face>=1.4
