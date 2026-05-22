@@ -1,9 +1,9 @@
 import os
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 import time
+import random
 import numpy as np
 from tqdm import tqdm
-import argparse
 
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
@@ -11,440 +11,502 @@ import torch
 from torch import nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+
+from datasets import Dataset
 from torch.utils.data import DataLoader
 
-from transformers import AutoTokenizer, AutoProcessor, AutoImageProcessor
-
-from dataset.dataset import VideoConversationDataset, collate_fn
-from model.unimodal import get_model
+from model.mm import LanguageModel, AudioModel, VisionModel, load_processors
+from dataloader import MultiModalDataset, collate_fn
 
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Train unimodal models for conversation classification")
-    
-    # Model config
-    parser.add_argument("--modal", type=str, required=True, choices=["text", "audio", "video"],
-                        help="Modality to train")
-    parser.add_argument("--freeze_encoder", action="store_true",
-                        help="Freeze pretrained encoder weights")
-    
-    # Data paths
-    parser.add_argument("--train_csv", type=str, default=".data/splits/train.csv",
-                        help="Path to training CSV file")
-    parser.add_argument("--val_csv", type=str, default=".data/splits/val.csv",
-                        help="Path to validation CSV file")
-    parser.add_argument("--test_csv", type=str, default=".data/splits/test.csv",
-                        help="Path to test CSV file")
-    parser.add_argument("--transcript_folder", type=str, default="data/transcripts/",
-                        help="Folder containing transcript CSV files")
-    parser.add_argument("--audio_folder", type=str, required=True,
-                        help="Folder containing audio files")
-    parser.add_argument("--video_folder", type=str, required=True,
-                        help="Folder containing video files")
-    
-    # Dataset params
-    parser.add_argument("--t", type=float, default=2.0,
-                        help="Time window in seconds")
-    parser.add_argument("--max_frames", type=int, default=16,
-                        help="Number of video frames to extract")
-    
-    # Training params
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Batch size for training")
-    parser.add_argument("--n_workers", type=int, default=4,
-                        help="Number of dataloader workers")
-    parser.add_argument("--n_epoch", type=int, default=100,
-                        help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-5,
-                        help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.01,
-                        help="Weight decay for optimizer")
-    
-    # Device
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to use for training")
-    
-    # Logging
-    parser.add_argument("--log_dir", type=str, default="log",
-                        help="Directory for saving logs and checkpoints")
-    parser.add_argument("--save_freq", type=int, default=5,
-                        help="Save checkpoint every N epochs")
-    
-    return parser.parse_args()
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--modal", type=str, required=True)
+parser.add_argument("--device", type=str, default="cuda")
+# data params
+parser.add_argument("--data_root", type=str, default="dataset/")
+parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--n_workers", type=int, default=4)
+# train params
+parser.add_argument("--n_epoch", type=int, default=100)
+parser.add_argument("--lr", type=float, default=1e-5)
+# training log
+parser.add_argument("--log_dir", type=str, default="log")
+args = parser.parse_args()
 
+assert args.modal in ["text", "audio", "video"]
 
-def init_log_dir(args):
-    """Initialize logging directory and tensorboard writer."""
+def init_log_dir():
     os.makedirs(args.log_dir, exist_ok=True)
-    time_str = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-    task_name = f"{time_str}_{args.modal}_t{args.t}_bs{args.batch_size}_lr{args.lr}"
-    if args.freeze_encoder:
-        task_name += "_frozen"
-    task_dir = os.path.join(args.log_dir, task_name)
-    os.makedirs(task_dir, exist_ok=True)
+    time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()).replace(" ", "_")
+    task_dir = os.path.join(args.log_dir, f"{time_str}_{args.modal}")
     writer = SummaryWriter(log_dir=task_dir)
-    
-    # Save args
-    with open(os.path.join(task_dir, "args.txt"), "w") as f:
-        for arg, value in vars(args).items():
-            f.write(f"{arg}: {value}\n")
-    
     return writer, task_dir
 
 
-def load_processors(modal):
-    """Load appropriate processors based on modality."""
-    tokenizer = None
-    audio_processor = None
-    video_processor = None
-    
-    if modal == "text":
-        print("Loading GPT-2 tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-    elif modal == "audio":
-        print("Loading HuBERT processor...")
-        audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
-    elif modal == "video":
-        print("Loading VideoMAE processor...")
-        video_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
-    
-    return tokenizer, audio_processor, video_processor
+def load_model():
+    if args.modal == "text":
+        model = LanguageModel(return_embeddings=False)
+    elif args.modal == "audio":
+        model = AudioModel(return_embeddings=False)
+    elif args.modal == "video":
+        model = VisionModel(return_embeddings=False)
+    return model
 
 
 def cal_metric(all_labels, all_logits):
-    """Calculate classification metrics."""
     accuracy = accuracy_score(all_labels, all_logits)
-    recall = recall_score(all_labels, all_logits, average=None, zero_division=0)
-    f1 = f1_score(all_labels, all_logits, average=None, zero_division=0)
-    precision = precision_score(all_labels, all_logits, average=None, zero_division=0)
-    
-    # Also calculate macro averages
-    macro_recall = recall_score(all_labels, all_logits, average='macro', zero_division=0)
-    macro_f1 = f1_score(all_labels, all_logits, average='macro', zero_division=0)
-    macro_precision = precision_score(all_labels, all_logits, average='macro', zero_division=0)
-    
-    return accuracy, recall, f1, precision, macro_recall, macro_f1, macro_precision
+    recall = recall_score(all_labels, all_logits, average=None)
+    f1 = f1_score(all_labels, all_logits, average=None)
+    precision = precision_score(all_labels, all_logits, average=None)
+    return accuracy, recall, f1, precision
 
 
 def idx2label(idx):
-    """Convert index to label name."""
-    return ["keep", "turn", "backchannel"][idx]
-
-
-def train_epoch(model, dataloader, optimizer, criterion, device, modal):
-    """Train for one epoch."""
-    model.train()
-    epoch_loss = 0.0
-    all_labels, all_logits = [], []
-    
-    pbar = tqdm(dataloader, desc="Training")
-    for batch in pbar:
-        # Get data based on modality
-        if modal == "text":
-            X = batch['text']['input_ids'].to(device)
-            attention_mask = batch['text']['attention_mask'].to(device)
-        elif modal == "audio":
-            X = batch['audio'].to(device)
-            attention_mask = None
-        elif modal == "video":
-            X = batch['video']['pixel_values'].to(device)
-            attention_mask = None
-        
-        y = batch['label'].to(device)
-        
-        optimizer.zero_grad()
-        
-        # Forward pass
-        if modal == "text":
-            pred = model(X, attention_mask)
-        else:
-            pred = model(X)
-        
-        loss = criterion(pred, y)
-        loss.backward()
-        optimizer.step()
-        
-        all_labels.extend(y.detach().cpu().numpy())
-        all_logits.extend(pred.argmax(dim=1).detach().cpu().numpy())
-        epoch_loss += loss.item()
-        
-        # Update progress bar
-        pbar.set_postfix({'loss': loss.item()})
-    
-    epoch_loss /= len(dataloader)
-    return epoch_loss, np.array(all_labels), np.array(all_logits)
-
-
-def validate(model, dataloader, criterion, device, modal):
-    """Validate the model."""
-    model.eval()
-    val_loss = 0.0
-    all_labels, all_logits = [], []
-    
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Validation")
-        for batch in pbar:
-            # Get data based on modality
-            if modal == "text":
-                X = batch['text']['input_ids'].to(device)
-                attention_mask = batch['text']['attention_mask'].to(device)
-            elif modal == "audio":
-                X = batch['audio'].to(device)
-                attention_mask = None
-            elif modal == "video":
-                X = batch['video']['pixel_values'].to(device)
-                attention_mask = None
-            
-            y = batch['label'].to(device)
-            
-            # Forward pass
-            if modal == "text":
-                pred = model(X, attention_mask)
-            else:
-                pred = model(X)
-            
-            loss = criterion(pred, y)
-            
-            all_labels.extend(y.detach().cpu().numpy())
-            all_logits.extend(pred.argmax(dim=1).detach().cpu().numpy())
-            val_loss += loss.item()
-            
-            # Update progress bar
-            pbar.set_postfix({'loss': loss.item()})
-    
-    val_loss /= len(dataloader)
-    return val_loss, np.array(all_labels), np.array(all_logits)
+    return ["keep", "turn", "bc"][idx]
 
 
 def main():
-    args = parse_args()
-    
-    print("="*60)
-    print(f"Training {args.modal.upper()} model")
-    print("="*60)
-    print(f"Time window: {args.t} seconds")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Epochs: {args.n_epoch}")
-    print(f"Freeze encoder: {args.freeze_encoder}")
-    print(f"Device: {args.device}")
-    print("="*60)
-    
-    # Load processors
-    tokenizer, audio_processor, video_processor = load_processors(args.modal)
-    
-    # Create datasets
-    print("\nLoading training dataset...")
-    train_set = VideoConversationDataset(
-        csv_file=args.train_csv,
-        transcript_folder=args.transcript_folder,
-        audio_folder=args.audio_folder,
-        video_folder=args.video_folder,
-        t=args.t,
+    tokenizer, _, audio_processor, video_processor = load_processors()
+    train_set = MultiModalDataset(
+        data_root=args.data_root,
+        split="train",
         modal=args.modal,
-        max_frames=args.max_frames,
         tokenizer=tokenizer,
         audio_processor=audio_processor,
-        video_processor=video_processor
+        video_processor=video_processor,
     )
-    
-    print("\nLoading validation dataset...")
-    val_set = VideoConversationDataset(
-        csv_file=args.val_csv,
-        transcript_folder=args.transcript_folder,
-        audio_folder=args.audio_folder,
-        video_folder=args.video_folder,
-        t=args.t,
+    val_set = MultiModalDataset(
+        data_root=args.data_root,
+        split="val",
         modal=args.modal,
-        max_frames=args.max_frames,
         tokenizer=tokenizer,
         audio_processor=audio_processor,
-        video_processor=video_processor
+        video_processor=video_processor,
     )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.n_workers,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=args.n_workers,
-        pin_memory=True
-    )
-    
-    # Initialize model
-    print(f"\nInitializing {args.modal} model...")
-    model = get_model(
-        args.modal,
-        num_classes=3,
-        return_embeddings=False,
-        freeze_encoder=args.freeze_encoder
-    ).to(args.device)
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # Initialize optimizer and criterion
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=args.n_workers)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=args.n_workers)
+
+    model = load_model().to(args.device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
-    
-    # Initialize logging
-    writer, task_dir = init_log_dir(args)
-    print(f"\nLogging to: {task_dir}")
-    print(f"Starting training...\n")
-    
-    best_val_acc = 0.0
-    best_val_f1 = 0.0
-    
-    # Training loop
-    for epoch in range(args.n_epoch):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{args.n_epoch}")
-        print(f"{'='*60}")
-        
-        # Train
-        train_loss, train_labels, train_logits = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, args.modal
-        )
-        
-        train_acc, train_recall, train_f1, train_precision, train_macro_recall, train_macro_f1, train_macro_precision = cal_metric(
-            train_labels, train_logits
-        )
-        
-        # Log training metrics
-        writer.add_scalar("train/loss", train_loss, epoch)
-        writer.add_scalar("train/accuracy", train_acc, epoch)
-        writer.add_scalar("train/macro_f1", train_macro_f1, epoch)
-        writer.add_scalar("train/macro_recall", train_macro_recall, epoch)
-        writer.add_scalar("train/macro_precision", train_macro_precision, epoch)
-        
-        for idx, (r, f, p) in enumerate(zip(train_recall, train_f1, train_precision)):
+
+    writer, task_dir = init_log_dir()
+
+    n_epoch = 10
+    t_bar = tqdm(range(n_epoch))
+    for epoch in t_bar:
+        # train
+        model.train()
+        n_batch = len(train_loader)
+        epoch_loss = 0.0
+        all_labels, all_logits = [], []
+        for i, (X, y) in enumerate(train_loader):
+            if X is None:
+                continue
+            if args.modal == "text":
+                X = X["input_ids"].to("cuda")
+            elif args.modal == "audio":
+                X = X.to("cuda")
+            elif args.modal == "video":
+                X = X["pixel_values"].to("cuda")
+            y = y.to("cuda")
+            optimizer.zero_grad()
+            
+            pred = model(X)
+            loss = criterion(pred, y)
+            loss.backward()
+            optimizer.step()
+
+            all_labels.extend(y.detach().cpu().numpy())
+            all_logits.extend(pred.argmax(dim=1).detach().cpu().numpy())
+
+            t_bar.set_description(f"Epoch {epoch} training | Batch {i}/{n_batch} | Loss {loss.item():.4f}")
+            epoch_loss += (loss.item() * args.batch_size)
+        epoch_loss = epoch_loss / n_batch
+        writer.add_scalar("train/loss", epoch_loss, epoch)
+        accuracy, recall, f1, precision = cal_metric(np.array(all_labels), np.array(all_logits))
+        writer.add_scalar("train/accuracy", accuracy, epoch)
+        for idx, r in enumerate(recall):
             writer.add_scalar(f"train/{idx2label(idx)}_recall", r, epoch)
+        for idx, f in enumerate(f1):
             writer.add_scalar(f"train/{idx2label(idx)}_f1", f, epoch)
+        for idx, p in enumerate(precision):
             writer.add_scalar(f"train/{idx2label(idx)}_precision", p, epoch)
-        
-        # Validate
-        val_loss, val_labels, val_logits = validate(
-            model, val_loader, criterion, args.device, args.modal
-        )
-        
-        val_acc, val_recall, val_f1, val_precision, val_macro_recall, val_macro_f1, val_macro_precision = cal_metric(
-            val_labels, val_logits
-        )
-        
-        # Log validation metrics
+
+        # val
+        model.eval()
+        n_batch = len(val_loader)
+        val_loss = 0.0
+        all_labels, all_logits = [], []
+        for i, (X, y) in enumerate(train_loader):
+            if X is None:
+                continue
+            if args.modal == "text":
+                X = X["input_ids"].to("cuda")
+            elif args.modal == "audio":
+                X = X.to("cuda")
+            elif args.modal == "video":
+                X = X["pixel_values"].to("cuda")
+            y = y.to("cuda")
+            with torch.no_grad():
+                pred = model(X)
+                loss = criterion(pred, y)
+                
+                all_labels.extend(y.detach().cpu().numpy())
+                all_logits.extend(pred.argmax(dim=1).detach().cpu().numpy())
+                val_loss += (loss.item() * args.batch_size)
+        val_loss = val_loss / n_batch
         writer.add_scalar("val/loss", val_loss, epoch)
-        writer.add_scalar("val/accuracy", val_acc, epoch)
-        writer.add_scalar("val/macro_f1", val_macro_f1, epoch)
-        writer.add_scalar("val/macro_recall", val_macro_recall, epoch)
-        writer.add_scalar("val/macro_precision", val_macro_precision, epoch)
-        
-        for idx, (r, f, p) in enumerate(zip(val_recall, val_f1, val_precision)):
+        accuracy, recall, f1, precision = cal_metric(np.array(all_labels), np.array(all_logits))
+        writer.add_scalar("val/accuracy", accuracy, epoch)
+        for idx, r in enumerate(recall):
             writer.add_scalar(f"val/{idx2label(idx)}_recall", r, epoch)
+        for idx, f in enumerate(f1):
             writer.add_scalar(f"val/{idx2label(idx)}_f1", f, epoch)
+        for idx, p in enumerate(precision):
             writer.add_scalar(f"val/{idx2label(idx)}_precision", p, epoch)
-        
-        # Print epoch summary
-        print(f"\n{'Train':<10} Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Macro-F1: {train_macro_f1:.4f}")
-        print(f"{'Val':<10} Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | Macro-F1: {val_macro_f1:.4f}")
-        print(f"\nPer-class F1 scores:")
-        print(f"  Keep: {val_f1[0]:.4f} | Turn: {val_f1[1]:.4f} | Backchannel: {val_f1[2]:.4f}")
-        
-        # Save checkpoint periodically
-        if (epoch + 1) % args.save_freq == 0:
-            save_path = os.path.join(task_dir, f"epoch_{epoch+1}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_f1': val_macro_f1
-            }, save_path)
-        
-        # Save best model based on accuracy
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_path = os.path.join(task_dir, "best_model_acc.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_f1': val_macro_f1
-            }, best_path)
-            print(f"✓ New best accuracy model saved! Acc: {best_val_acc:.4f}")
-        
-        # Save best model based on F1
-        if val_macro_f1 > best_val_f1:
-            best_val_f1 = val_macro_f1
-            best_path = os.path.join(task_dir, "best_model_f1.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_f1': val_macro_f1
-            }, best_path)
-            print(f"✓ New best F1 model saved! F1: {best_val_f1:.4f}")
-    
-    writer.close()
-    print(f"\n{'='*60}")
-    print("Training completed!")
-    print(f"Best validation accuracy: {best_val_acc:.4f}")
-    print(f"Best validation macro-F1: {best_val_f1:.4f}")
-    print(f"Models saved to: {task_dir}")
-    print(f"{'='*60}")
+
+        save_path = os.path.join(task_dir, f"epoch_{epoch}.pt")
+        torch.save(model.state_dict(), save_path)
 
 
 if __name__ == "__main__":
     main()
 
+# import os
+# os.environ['TOKENIZERS_PARALLELISM'] = "false"
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+# import time
+# import gc
+# import numpy as np
+# from tqdm import tqdm
+
+# from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+# import torch
+# from torch import nn
+# import torch.optim as optim
+# from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.data import DataLoader
+
+# from model.mm import LanguageModel, AudioModel, VisionModel, load_processors
+# from training_dataloader import MultiModalDataset, collate_fn
+
+# import argparse
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--modal", type=str, required=True)
+# parser.add_argument("--device", type=str, default="cuda")
+# # data params
+# parser.add_argument("--data_root", type=str, default="dataset/")
+# parser.add_argument("--batch_size", type=int, default=1)
+# parser.add_argument("--n_workers", type=int, default=0)
+# # train params
+# parser.add_argument("--n_epoch", type=int, default=100)
+# parser.add_argument("--lr", type=float, default=1e-5)
+# parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+# parser.add_argument("--mixed_precision", action="store_true")
+# parser.add_argument("--max_grad_norm", type=float, default=1.0)
+# # training log
+# parser.add_argument("--log_dir", type=str, default="log")
+# args = parser.parse_args()
+
+# assert args.modal in ["text", "audio", "video"]
+
+# def init_log_dir():
+#     os.makedirs(args.log_dir, exist_ok=True)
+#     time_str = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+#     task_dir = os.path.join(args.log_dir, f"{time_str}_{args.modal}")
+#     writer = SummaryWriter(log_dir=task_dir)
+#     return writer, task_dir
 
 
-"""
-# Train text model
-python train_unimodal.py \
-  --modal text \
-  --train_csv ./data/splits/train.csv \
-  --val_csv ./data/splits/val.csv \
-  --transcript_folder ./data/transcripts/ \
-  --audio_folder /home/mudasir/ankit/MM-F2F/data/downloads/audio/ \
-  --video_folder /home/mudasir/ankit/MM-F2F/data/downloads/videos/ \
-  --t 2.0 \
-  --batch_size 16 \
-  --n_epoch 50 \
-  --lr 1e-5
+# def load_model():
+#     if args.modal == "text":
+#         model = LanguageModel(return_embeddings=False)
+#     elif args.modal == "audio":
+#         model = AudioModel(return_embeddings=False)
+#     elif args.modal == "video":
+#         model = VisionModel(return_embeddings=False)
+#     return model
 
-# Train audio model with frozen encoder
-python train_unimodal.py \
-  --modal audio \
-  --freeze_encoder \
-  --batch_size 8 \
-  --n_epoch 50 \
-  --audio_folder /home/mudasir/ankit/MM-F2F/data/downloads/audio/ \
-  --video_folder /home/mudasir/ankit/MM-F2F/data/downloads/videos/
 
-# Train video model
-python train_unimodal.py \
-  --modal video \
-  --batch_size 4 \
-  --max_frames 16 \
-  --n_epoch 50 \
-  --audio_folder /home/mudasir/ankit/MM-F2F/data/downloads/audio/ \
-  --video_folder /home/mudasir/ankit/MM-F2F/data/downloads/videos/
+# def cal_metric(all_labels, all_logits):
+#     accuracy = accuracy_score(all_labels, all_logits)
+#     recall = recall_score(all_labels, all_logits, average=None, zero_division=0)
+#     f1 = f1_score(all_labels, all_logits, average=None, zero_division=0)
+#     precision = precision_score(all_labels, all_logits, average=None, zero_division=0)
+#     return accuracy, recall, f1, precision
 
-"""
+
+# def idx2label(idx):
+#     return ["keep", "turn", "bc"][idx]
+
+
+# def clear_memory():
+#     """Aggressively clear GPU memory"""
+#     gc.collect()
+#     if torch.cuda.is_available():
+#         torch.cuda.empty_cache()
+#         torch.cuda.synchronize()
+
+
+# def main():
+#     # Clear memory at start
+#     clear_memory()
+    
+#     tokenizer, _, audio_processor, video_processor = load_processors()
+    
+#     train_set = MultiModalDataset(
+#         data_root=args.data_root,
+#         split="train",
+#         modal=args.modal,
+#         tokenizer=tokenizer,
+#         audio_processor=audio_processor,
+#         video_processor=video_processor,
+#     )
+#     val_set = MultiModalDataset(
+#         data_root=args.data_root,
+#         split="val",
+#         modal=args.modal,
+#         tokenizer=tokenizer,
+#         audio_processor=audio_processor,
+#         video_processor=video_processor,
+#     )
+
+#     train_loader = DataLoader(
+#         train_set, 
+#         batch_size=args.batch_size, 
+#         shuffle=True, 
+#         collate_fn=collate_fn, 
+#         num_workers=args.n_workers,
+#         pin_memory=False,  # Disable to save memory
+#         prefetch_factor=None if args.n_workers == 0 else 2
+#     )
+#     val_loader = DataLoader(
+#         val_set, 
+#         batch_size=args.batch_size, 
+#         shuffle=False, 
+#         collate_fn=collate_fn, 
+#         num_workers=args.n_workers,
+#         pin_memory=False,
+#         prefetch_factor=None if args.n_workers == 0 else 2
+#     )
+
+#     model = load_model().to(args.device)
+    
+#     # Enable gradient checkpointing to save memory
+#     try:
+#         if hasattr(model, 'transformer'):  # Text model
+#             model.transformer.gradient_checkpointing_enable()
+#         elif hasattr(model, 'hubert'):  # Audio model
+#             model.hubert.gradient_checkpointing_enable()
+#         elif hasattr(model, 'model'):  # Vision model
+#             model.model.gradient_checkpointing_enable()
+#     except Exception as e:
+#         print(f"Could not enable gradient checkpointing: {e}")
+    
+#     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+#     criterion = nn.CrossEntropyLoss()
+    
+#     # Mixed precision training with updated API
+#     scaler = torch.amp.GradScaler('cuda') if args.mixed_precision and args.device == "cuda" else None
+
+#     writer, task_dir = init_log_dir()
+    
+#     print(f"Starting training for {args.modal} model")
+#     print(f"Batch size: {args.batch_size}, Gradient accumulation steps: {args.gradient_accumulation_steps}")
+#     print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    
+#     # Print GPU memory info
+#     if torch.cuda.is_available():
+#         print(f"GPU: {torch.cuda.get_device_name(0)}")
+#         print(f"Initial GPU memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f} GB")
+#         print(f"Initial GPU memory reserved: {torch.cuda.memory_reserved(0)/1024**3:.2f} GB")
+
+#     t_bar = tqdm(range(args.n_epoch))
+#     for epoch in t_bar:
+#         # ============ TRAINING ============
+#         model.train()
+#         n_batch = len(train_loader)
+#         epoch_loss = 0.0
+#         all_labels, all_logits = [], []
+        
+#         optimizer.zero_grad()
+        
+#         for i, batch_data in enumerate(train_loader):
+#             try:
+#                 # Unpack based on modality
+#                 if args.modal == "text":
+#                     X, y = batch_data
+#                     X = X["input_ids"].to(args.device, non_blocking=True)
+#                 elif args.modal == "audio":
+#                     X, y = batch_data
+#                     X = X.to(args.device, non_blocking=True)
+#                 elif args.modal == "video":
+#                     X, y = batch_data
+#                     X = X["pixel_values"].to(args.device, non_blocking=True)
+                
+#                 y = y.to(args.device, non_blocking=True)
+                
+#                 # Mixed precision training with updated API
+#                 if scaler is not None:
+#                     with torch.amp.autocast('cuda'):
+#                         pred = model(X)
+#                         loss = criterion(pred, y)
+#                         loss = loss / args.gradient_accumulation_steps
+                    
+#                     scaler.scale(loss).backward()
+                    
+#                     # Update weights every N steps
+#                     if (i + 1) % args.gradient_accumulation_steps == 0:
+#                         # Gradient clipping
+#                         scaler.unscale_(optimizer)
+#                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        
+#                         scaler.step(optimizer)
+#                         scaler.update()
+#                         optimizer.zero_grad()
+#                 else:
+#                     pred = model(X)
+#                     loss = criterion(pred, y)
+#                     loss = loss / args.gradient_accumulation_steps
+#                     loss.backward()
+                    
+#                     # Update weights every N steps
+#                     if (i + 1) % args.gradient_accumulation_steps == 0:
+#                         # Gradient clipping
+#                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+#                         optimizer.step()
+#                         optimizer.zero_grad()
+
+#                 # Collect predictions (detach before moving to CPU)
+#                 with torch.no_grad():
+#                     all_labels.extend(y.cpu().numpy())
+#                     all_logits.extend(pred.argmax(dim=1).cpu().numpy())
+
+#                 # Calculate actual loss value for logging
+#                 actual_loss = loss.item() * args.gradient_accumulation_steps
+                
+#                 t_bar.set_description(
+#                     f"Epoch {epoch} training | Batch {i+1}/{n_batch} | Loss {actual_loss:.4f}"
+#                 )
+#                 epoch_loss += (actual_loss * args.batch_size)
+                
+#                 # Aggressive memory cleanup every batch
+#                 del X, y, pred, loss
+                
+#                 # More frequent memory clearing for stability
+#                 if (i + 1) % 10 == 0:
+#                     torch.cuda.empty_cache()
+                    
+#             except RuntimeError as e:
+#                 if "out of memory" in str(e):
+#                     print(f"\n[WARNING] OOM at batch {i+1}, clearing cache and skipping batch...")
+#                     torch.cuda.empty_cache()
+#                     optimizer.zero_grad()
+#                     continue
+#                 else:
+#                     raise e
+        
+#         # Handle remaining gradients
+#         if (len(train_loader)) % args.gradient_accumulation_steps != 0:
+#             if scaler is not None:
+#                 scaler.unscale_(optimizer)
+#                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+#                 scaler.step(optimizer)
+#                 scaler.update()
+#             else:
+#                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+#                 optimizer.step()
+#             optimizer.zero_grad()
+        
+#         epoch_loss = epoch_loss / len(train_set)
+#         writer.add_scalar("train/loss", epoch_loss, epoch)
+#         accuracy, recall, f1, precision = cal_metric(np.array(all_labels), np.array(all_logits))
+#         writer.add_scalar("train/accuracy", accuracy, epoch)
+#         for idx, r in enumerate(recall):
+#             writer.add_scalar(f"train/{idx2label(idx)}_recall", r, epoch)
+#         for idx, f in enumerate(f1):
+#             writer.add_scalar(f"train/{idx2label(idx)}_f1", f, epoch)
+#         for idx, p in enumerate(precision):
+#             writer.add_scalar(f"train/{idx2label(idx)}_precision", p, epoch)
+
+#         # ============ VALIDATION ============
+#         model.eval()
+#         n_batch = len(val_loader)
+#         val_loss = 0.0
+#         all_labels, all_logits = [], []
+        
+#         with torch.no_grad():
+#             for i, batch_data in enumerate(val_loader):
+#                 try:
+#                     # Unpack based on modality
+#                     if args.modal == "text":
+#                         X, y = batch_data
+#                         X = X["input_ids"].to(args.device, non_blocking=True)
+#                     elif args.modal == "audio":
+#                         X, y = batch_data
+#                         X = X.to(args.device, non_blocking=True)
+#                     elif args.modal == "video":
+#                         X, y = batch_data
+#                         X = X["pixel_values"].to(args.device, non_blocking=True)
+                    
+#                     y = y.to(args.device, non_blocking=True)
+                    
+#                     if scaler is not None:
+#                         with torch.amp.autocast('cuda'):
+#                             pred = model(X)
+#                             loss = criterion(pred, y)
+#                     else:
+#                         pred = model(X)
+#                         loss = criterion(pred, y)
+                    
+#                     all_labels.extend(y.cpu().numpy())
+#                     all_logits.extend(pred.argmax(dim=1).cpu().numpy())
+#                     val_loss += (loss.item() * args.batch_size)
+                    
+#                     # Free memory
+#                     del X, y, pred, loss
+                    
+#                     if (i + 1) % 10 == 0:
+#                         torch.cuda.empty_cache()
+                        
+#                 except RuntimeError as e:
+#                     if "out of memory" in str(e):
+#                         print(f"\n[WARNING] OOM at validation batch {i+1}, skipping...")
+#                         torch.cuda.empty_cache()
+#                         continue
+#                     else:
+#                         raise e
+        
+#         val_loss = val_loss / len(val_set)
+#         writer.add_scalar("val/loss", val_loss, epoch)
+#         accuracy, recall, f1, precision = cal_metric(np.array(all_labels), np.array(all_logits))
+#         writer.add_scalar("val/accuracy", accuracy, epoch)
+#         for idx, r in enumerate(recall):
+#             writer.add_scalar(f"val/{idx2label(idx)}_recall", r, epoch)
+#         for idx, f in enumerate(f1):
+#             writer.add_scalar(f"val/{idx2label(idx)}_f1", f, epoch)
+#         for idx, p in enumerate(precision):
+#             writer.add_scalar(f"val/{idx2label(idx)}_precision", p, epoch)
+
+#         # Save checkpoint
+#         save_path = os.path.join(task_dir, f"epoch_{epoch}.pt")
+#         torch.save(model.state_dict(), save_path)
+        
+#         # Clear memory after each epoch
+#         clear_memory()
+        
+#         print(f"\nEpoch {epoch} | Train Loss: {epoch_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {accuracy:.4f}")
+        
+#         if torch.cuda.is_available():
+#             print(f"GPU memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f} GB")
+
+#     writer.close()
+#     print(f"Training complete! Models saved to {task_dir}")
+
+
+# if __name__ == "__main__":
+#     main()

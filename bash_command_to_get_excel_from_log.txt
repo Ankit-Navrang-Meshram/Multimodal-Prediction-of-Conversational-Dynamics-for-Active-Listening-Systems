@@ -1,0 +1,18 @@
+python - << 'EOF'
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+import pandas as pd, glob
+
+event_files = glob.glob("events.out.tfevents.*")
+assert event_files, "No TensorBoard event file found"
+
+ea = EventAccumulator(event_files[0])
+ea.Reload()
+
+rows = []
+for tag in ea.Tags()["scalars"]:
+    for e in ea.Scalars(tag):
+        rows.append({"metric": tag, "step": e.step, "value": e.value})
+
+pd.DataFrame(rows).to_excel("training_logs.xlsx", index=False)
+print("Saved training_logs.xlsx")
+EOF
